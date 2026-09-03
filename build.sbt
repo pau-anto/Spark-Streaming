@@ -29,7 +29,8 @@ lazy val producer = (project in file("producer"))
     commonSettings,
     libraryDependencies ++= Seq(
       "org.apache.spark" %% "spark-core" % sparkVersion,
-      "com.typesafe"      % "config"     % "1.4.3"
+      "org.apache.spark" %% "spark-sql" % sparkVersion,
+      "com.typesafe" % "config" % "1.4.3"
     )
   )
 
