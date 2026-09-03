@@ -118,9 +118,9 @@ object ImageProducer {
     // Affichage des fichiers
     // ----------------------------------------------------------
 
-    files.foreach { file =>
-      log(s"Fichier trouve : $file")
-    }
+    // *files.foreach { file =>
+      // log(s" Fichier trouve: $file")
+    // }
 
     // ----------------------------------------------------------
   // Creation des batches
@@ -175,7 +175,7 @@ object ImageProducer {
 
       try {
 
-        log("Nouvelle partition demarree")
+        // log("Nouvelle partition demarree")
 
         partition.foreach { file =>
 
@@ -265,10 +265,6 @@ object ImageProducer {
         log("FileSystem ferme")
       }
     }
-
-    // ----------------------------------------------------------
-    // Fin du batch
-    // ----------------------------------------------------------
 
     log(
       s"========== FIN BATCH ${batchIndex + 1}/${batches.length} =========="
