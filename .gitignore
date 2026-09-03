@@ -1,0 +1,21 @@
+target/
+project/target/
+project/project/
+.bsp/
+.idea/
+.metals/
+.bloop/
+.vscode/
+.DS_Store
+
+# sorties de traitement, jamais versionnees
+dest/*
+output/*
+!dest/.gitkeep
+!output/.gitkeep
+
+# artefacts ML
+ml-service/model/*
+!ml-service/model/.gitkeep
+__pycache__/
+.ipynb_checkpoints/
