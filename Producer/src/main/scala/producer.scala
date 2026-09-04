@@ -1,5 +1,4 @@
 import com.typesafe.config.ConfigFactory
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
 
@@ -29,15 +28,15 @@ object ImageProducer {
 
     val config = ConfigFactory.load()
 
-    val sourceDir =
-      new Path(
+   val sourceDir =
+    new Path(
         config.getString("producer.source.dir")
-      ).toUri.toString
+    ).toUri.toString
 
     val destinationDir =
-      new Path(
+    new Path(
         config.getString("producer.destination.dir")
-      ).toUri.toString
+    ).toUri.toString
 
     val batchSize =
       config.getInt("producer.batch.size")
@@ -113,26 +112,28 @@ object ImageProducer {
       // Copie en parallele
       // --------------------------------------------------------
 
-      filesRDD.foreachPartition { partition =>
+    filesRDD.foreachPartition { partition =>
 
         val conf =
           new Configuration()
 
-        val sourceFS =
-          FileSystem.get(conf)
+      val sourceFS =
+        FileSystem.get(conf)
 
-        val destinationFS =
-          FileSystem.get(conf)
+      val destinationFS =
+        FileSystem.get(conf)
 
-        partition.foreach { file =>
+      var count = 0
 
-          val sourcePath =
-            new Path(file)
+      partition.foreach { file =>
 
-          val fileName =
-            sourcePath.getName
+        val sourcePath =
+          new Path(file)
 
-          val destinationPath =
+        val fileName =
+          sourcePath.getName
+
+        val destinationPath =
             new Path(
               s"$destinationDir/$fileName"
             )
@@ -148,27 +149,27 @@ object ImageProducer {
             val startTime =
               System.nanoTime()
 
-            val copied =
-              FileUtil.copy(
-                sourceFS,
-                sourcePath,
-                destinationFS,
-                destinationPath,
-                deleteSource,
-                overwrite,
-                conf
-              )
+        val copied =
+          FileUtil.copy(
+            sourceFS,
+            sourcePath,
+            destinationFS,
+            destinationPath,
+            deleteSource,
+            overwrite,
+            conf
+          )
 
             val durationMs =
               (System.nanoTime() - startTime) / 1000000
 
-            if (copied) {
+        if (copied) {
 
               log(
                 s"SUCCES : $fileName | ${durationMs} ms"
               )
 
-            } else {
+        } else {
 
               log(
                 s"ECHEC : $fileName | ${durationMs} ms"
@@ -182,7 +183,7 @@ object ImageProducer {
               log(
                 s"ERREUR : $fileName | ${e.getClass.getSimpleName} | ${e.getMessage}"
               )
-          }
+        }
         }
 
         sourceFS.close()
@@ -201,10 +202,10 @@ object ImageProducer {
 
         log(
           s"Attente de ${intervalMs} ms"
-        )
+          )
 
-        Thread.sleep(intervalMs)
-      }
+          Thread.sleep(intervalMs)
+        }
     }
 
     // ----------------------------------------------------------
