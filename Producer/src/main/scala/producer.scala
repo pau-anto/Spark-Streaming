@@ -10,10 +10,7 @@ import java.time.format.DateTimeFormatter
 
 object ImageProducer {
 
-  // ------------------------------------------------------------
   // Timestamp
-  // ------------------------------------------------------------
-
   val timestampFormatter =
     DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
 
@@ -24,13 +21,7 @@ object ImageProducer {
     println(s"[$timestamp] $message")
   }
 
-  // ------------------------------------------------------------
-  // Main
-  // ------------------------------------------------------------
-
   def main(args: Array[String]): Unit = {
-
-    log("========== DEMARRAGE DU PRODUCER ==========")
 
     // ----------------------------------------------------------
     // Configuration
@@ -54,13 +45,14 @@ object ImageProducer {
     val intervalMs =
       config.getLong("producer.interval.ms")
 
-    log(s"Source      : $sourceDir")
-    log(s"Destination : $destinationDir")
-    log(s"Batch size  : $batchSize")
-    log(s"Intervalle  : ${intervalMs} ms")
+    val deleteSource =
+      config.getBoolean("producer.delete.source")
+
+    val overwrite =
+      config.getBoolean("producer.overwrite")
 
     // ----------------------------------------------------------
-    // SparkSession
+    // Spark
     // ----------------------------------------------------------
 
     val spark =
@@ -71,111 +63,66 @@ object ImageProducer {
 
     spark.sparkContext.setLogLevel("WARN")
 
-    log("SparkSession demarree")
-
-    // ----------------------------------------------------------
-    // Recuperation du SparkContext
-    // ----------------------------------------------------------
-
     val sc =
       spark.sparkContext
 
-    // ----------------------------------------------------------
-    // Decouverte des fichiers avec binaryFiles
-    // ----------------------------------------------------------
+    log("Producer demarre")
 
-    log("Recherche des fichiers dans la source...")
+    // ----------------------------------------------------------
+    // Decouverte des fichiers
+    // ----------------------------------------------------------
 
     val filesRDD =
       sc.binaryFiles(sourceDir)
         .keys
         .filter(isImageFile)
 
-    // ----------------------------------------------------------
-    // Recuperation des fichiers
-    // ----------------------------------------------------------
-
-    log("Recuperation de la liste des fichiers...")
-
     val files =
       filesRDD.collect()
 
-    log(s"${files.length} fichier(s) image trouve(s)")
+    log(s"${files.length} image(s) trouvee(s)")
 
     if (files.isEmpty) {
-
-      log("Aucune image trouvee")
-
+      log("Aucune image a copier")
       spark.stop()
-
-      log("SparkSession arretee")
-      log("========== FIN DU PRODUCER ==========")
-
       return
     }
 
     // ----------------------------------------------------------
-    // Affichage des fichiers
+    // Creation des batches
     // ----------------------------------------------------------
 
-    // *files.foreach { file =>
-      // log(s" Fichier trouve: $file")
-    // }
+    val batches =
+      files.toSeq.grouped(batchSize).toSeq
 
     // ----------------------------------------------------------
-  // Creation des batches
-  // ----------------------------------------------------------
+    // Traitement des batches
+    // ----------------------------------------------------------
 
-  val batches =
-    files.toSeq.grouped(batchSize).toSeq
+    batches.zipWithIndex.foreach { case (batch, batchIndex) =>
 
-  log(
-    s"${batches.length} batch(s) cree(s)"
-  )
+      log(
+        s"Debut batch ${batchIndex + 1}/${batches.length} - ${batch.size} image(s)"
+      )
 
-  // ----------------------------------------------------------
-  // Traitement des batches
-  // ----------------------------------------------------------
+      // RDD du batch
+      val filesRDD =
+        sc.parallelize(batch)
 
-  batches.zipWithIndex.foreach { case (batch, batchIndex) =>
+      // --------------------------------------------------------
+      // Copie en parallele
+      // --------------------------------------------------------
 
-    log(
-      s"========== DEBUT BATCH ${batchIndex + 1}/${batches.length} =========="
-    )
+      filesRDD.foreachPartition { partition =>
 
-    log(
-      s"${batch.size} fichier(s) dans ce batch"
-    )
+        val conf =
+          new Configuration()
 
-    // --------------------------------------------------------
-    // Creation du RDD
-    // --------------------------------------------------------
+        val sourceFS =
+          FileSystem.get(conf)
 
-    val filesParallelized =
-      sc.parallelize(batch)
-
-    log(
-      s"RDD cree avec ${filesParallelized.getNumPartitions} partition(s)"
-    )
-
-    // --------------------------------------------------------
-    // Copie en parallele
-    // --------------------------------------------------------
-
-    filesParallelized.foreachPartition { partition =>
-
-      val conf =
-        new Configuration()
-
-      val sourceFS =
-        FileSystem.get(conf)
-
-      val destinationFS =
-        FileSystem.get(conf)
-
-      try {
-
-        // log("Nouvelle partition demarree")
+        val destinationFS =
+          FileSystem.get(conf)
 
         partition.foreach { file =>
 
@@ -190,119 +137,88 @@ object ImageProducer {
               s"$destinationDir/$fileName"
             )
 
-          // --------------------------------------------------
-          // Debut copie
-          // --------------------------------------------------
+          // ----------------------------------------------------
+          // Copie d'un fichier
+          // ----------------------------------------------------
 
-          log(s"DEBUT COPIE : $fileName")
+          try {
 
-          log(s"Source      : $sourcePath")
+            log(s"Copie de $fileName...")
 
-          log(s"Destination : $destinationPath")
+            val startTime =
+              System.nanoTime()
 
-          val startTime =
-            System.nanoTime()
+            val copied =
+              FileUtil.copy(
+                sourceFS,
+                sourcePath,
+                destinationFS,
+                destinationPath,
+                deleteSource,
+                overwrite,
+                conf
+              )
 
-          // --------------------------------------------------
-          // Copie avec Hadoop
-          // --------------------------------------------------
+            val durationMs =
+              (System.nanoTime() - startTime) / 1000000
 
-          val copied =
-            FileUtil.copy(
-              sourceFS,
-              sourcePath,
-              destinationFS,
-              destinationPath,
-              false,
-              true,
-              conf
-            )
+            if (copied) {
 
-          // --------------------------------------------------
-          // Temps de copie
-          // --------------------------------------------------
+              log(
+                s"SUCCES : $fileName | ${durationMs} ms"
+              )
 
-          val durationMs =
-            (System.nanoTime() - startTime) / 1000000
+            } else {
 
-          if (copied) {
+              log(
+                s"ECHEC : $fileName | ${durationMs} ms"
+              )
+            }
 
-            log(
-              s"SUCCES : $fileName | temps = ${durationMs} ms"
-            )
+          } catch {
 
-          } else {
+            case e: Exception =>
 
-            log(
-              s"ECHEC : $fileName | temps = ${durationMs} ms"
-            )
+              log(
+                s"ERREUR : $fileName | ${e.getClass.getSimpleName} | ${e.getMessage}"
+              )
           }
         }
 
-        log("Partition terminee")
-
-      } catch {
-
-        case e: Exception =>
-
-          log(
-            s"ERREUR : ${e.getClass.getSimpleName}"
-          )
-
-          log(
-            s"Message : ${e.getMessage}"
-          )
-
-          e.printStackTrace()
-
-          throw e
-
-      } finally {
-
         sourceFS.close()
         destinationFS.close()
-
-        log("FileSystem ferme")
       }
-    }
-
-    log(
-      s"========== FIN BATCH ${batchIndex + 1}/${batches.length} =========="
-    )
-
-    // ----------------------------------------------------------
-    // Pause de 2 secondes
-    // ----------------------------------------------------------
-
-    if (batchIndex < batches.length - 1) {
 
       log(
-        s"Attente de ${intervalMs} ms avant le prochain batch"
+        s"Fin batch ${batchIndex + 1}/${batches.length}"
       )
 
-      Thread.sleep(intervalMs)
+      // --------------------------------------------------------
+      // Pause entre les batches
+      // --------------------------------------------------------
 
-      log("Fin de l'attente")
+      if (batchIndex < batches.length - 1) {
+
+        log(
+          s"Attente de ${intervalMs} ms"
+        )
+
+        Thread.sleep(intervalMs)
+      }
     }
-  }
 
     // ----------------------------------------------------------
     // Fin
     // ----------------------------------------------------------
 
-    log("Toutes les partitions ont termine")
+    log("Toutes les images ont ete traitees")
 
     spark.stop()
 
-    log("SparkSession arretee")
-
-    log("========== FIN DU PRODUCER ==========")
+    log("Producer termine")
   }
 
-  // ------------------------------------------------------------
   // Verification des fichiers images
-  // ------------------------------------------------------------
-
   def isImageFile(path: String): Boolean = {
 
     val lowerPath =
