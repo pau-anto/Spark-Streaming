@@ -58,38 +58,37 @@ object ImageClassifierConsumer {
     // 4. Décoder binaire JPG --> pixel numériques 
     def decodeJPG(jpgBytes: Array[Byte]): Array[Array[Array[Int]]] = {
     
-        try{
-            val inputStream = new ByteArrayInputStream(jpgBytes)
+        val inputStream = new ByteArrayInputStream(jpgBytes)
 
-            // ImageIO.rea() décode le JPG en BufferedImage
-            val bufferedImage = ImageIO.read(inputStream)
-
-            // récupérer les dimensions de l'image
-            val width = bufferedImage.getWidth 
-            val height = bufferedImage.getHeight
-
-            // Créer la matrice 3D pour stocker les pixels (hauteur x largeur x canaux)
-            val pixels = Array.ofDim[Int](height, width, 3) // 3 canaux pour RGB
-
-            // Boucler sur chaque pixel 
-            for (y <- 0 until height; x <- 0 until width) {
-                // getRGB() retourne un Int contenant ARGB
-                // Bits: [Alpha, Red, Green, Blue]
-                val rgb = bufferedImage.getRGB(x, y)
-
-                // Extraire les composantes RGB avec des opérations binaires
-                pixels(y)(x)(0) = (rgb >> 16) & 0xFF // Rouge
-                pixels(y)(x)(1) = (rgb >> 8) & 0xFF  // Vert
-                pixels(y)(x)(2) = rgb & 0xFF         // Bleu
-            }
-
-            pixels // retourner la matrice de pixels
-
+        // ImageIO.rea() décode le JPG en BufferedImage
+        val bufferedImage = try {
+            ImageIO.read(inputStream)
         } catch {
             case e: Exception =>
                 println(s"Erreur lors du décodage du JPG: ${e.getMessage}")
-                Array.ofDim[Int](0, 0, 0) // retourner une matrice vide en cas d'erreur
+                return Array.ofDim[Int](0, 0, 0) // retourner une matrice vide en cas d'erreur
         }
+
+        // récupérer les dimensions de l'image
+        val width = bufferedImage.getWidth 
+        val height = bufferedImage.getHeight
+
+        // Créer la matrice 3D pour stocker les pixels (hauteur x largeur x canaux)
+        val pixels = Array.ofDim[Int](height, width, 3) // 3 canaux pour RGB
+
+        // Boucler sur chaque pixel 
+        for (y <- 0 until height; x <- 0 until width) {
+            // getRGB() retourne un Int contenant ARGB
+            // Bits: [Alpha, Red, Green, Blue]
+            val rgb = bufferedImage.getRGB(x, y)
+
+            // Extraire les composantes RGB avec des opérations binaires
+            pixels(y)(x)(0) = (rgb >> 16) & 0xFF // Rouge
+            pixels(y)(x)(1) = (rgb >> 8) & 0xFF  // Vert
+            pixels(y)(x)(2) = rgb & 0xFF         // Bleu
+        }
+
+        pixels // retourner la matrice de pixels
     }
 
     // Enregistrer la fonction comme UDF pour l'utiliser dans les transformations Spark
