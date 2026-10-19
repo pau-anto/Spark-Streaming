@@ -127,16 +127,13 @@ object ImageProducer {
 
       partition.foreach { file =>
 
-        val sourcePath =
-          new Path(file)
+        val sourcePath = new Path(file)
 
-        val fileName =
-          sourcePath.getName
+        val fileName = sourcePath.getName
 
-        val destinationPath =
-            new Path(
-              s"$destinationDir/$fileName"
-            )
+        val className  = sourcePath.getParent.getName
+        
+        val destinationPath = new Path(s"$destinationDir/${className}_$fileName")
 
           // ----------------------------------------------------
           // Copie d'un fichier
