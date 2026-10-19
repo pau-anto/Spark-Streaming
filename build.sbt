@@ -20,7 +20,8 @@ val sparkJavaOptions = Seq(
 lazy val commonSettings = Seq(
   fork           := true,
   javaOptions  ++= sparkJavaOptions,
-  outputStrategy := Some(StdoutOutput)
+  outputStrategy := Some(StdoutOutput),
+  run / baseDirectory := (ThisBuild / baseDirectory).value
 )
 
 lazy val producer = (project in file("producer"))
@@ -39,10 +40,10 @@ lazy val consumer = (project in file("consumer"))
     name := "consumer",
     commonSettings,
     libraryDependencies ++= Seq(
-      "org.apache.spark" %% "spark-core" % sparkVersion,
-      "org.apache.spark" %% "spark-sql"  % sparkVersion,
-      "com.typesafe"      % "config"     % "1.4.3"
-    )
+      "org.apache.spark"        %% "spark-core"  % sparkVersion,
+      "org.apache.spark"        %% "spark-sql"   % sparkVersion,
+      "com.typesafe"             % "config"      % "1.4.3",
+      "com.microsoft.onnxruntime" % "onnxruntime" % "1.20.0"    )
   )
 
 lazy val root = (project in file("."))
