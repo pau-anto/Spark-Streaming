@@ -7,7 +7,7 @@
 import java.awt.RenderingHints
 import java.awt.image.BufferedImage
 import java.io.{ByteArrayInputStream, File, FileWriter, PrintWriter}
-import java.time.{Instant, LocalDateTime}
+import java.time.{Instant, ZoneId}
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import javax.imageio.ImageIO
@@ -18,17 +18,14 @@ import scala.collection.mutable
 import ai.onnxruntime.{OnnxTensor, OrtEnvironment, OrtSession}
 import com.typesafe.config.ConfigFactory
 
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
-import org.apache.spark.sql.functions.{col, current_timestamp, regexp_extract, round, size, spark_partition_id, udf}
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions.{col, current_timestamp, regexp_extract, size, udf}
 import org.apache.spark.sql.streaming.StreamingQueryListener
 import org.apache.spark.sql.streaming.StreamingQueryListener._
 import org.apache.spark.sql.types._
 
-// Résultat de l'UDF de prétraitement : le vecteur + le temps de décodage
-case class Prepared(features: Array[Float], decode_ms: Double)
-
-// Résultat de l'UDF de prédiction : label, probabilité + le temps d'inférence
-case class Prediction(predicted_label: String, probability: Float, predict_ms: Double)
+// Résultat renvoyé par l'UDF de prédiction (devient une colonne struct dans Spark)
+case class Prediction(predicted_label: String, probability: Float)
 
 // ----------------------------------------------------------------------
 // Chargement du modèle ONNX une seule fois (et pas à chaque image)
@@ -46,180 +43,81 @@ object OnnxModel {
 }
 
 // ----------------------------------------------------------------------
-// Statistiques de performance, écrites dans deux CSV
-//   perf.csv        : une ligne "bloc" tous les 100 images
-//                     + une ligne "total" quand le flux s'arrête
-//                     (moyenne, médiane, min, max en ms de la durée
-//                      des batchs et du temps d'attente des images)
-//   perf_images.csv : une ligne par image (ses temps et sa prédiction)
-// Les deux fichiers sont complétés à la fin : les tests s'accumulent.
+// Suivi du temps de traitement
+//   perf.csv : une ligne par image
+//              -> image ; heure_production ; heure_ecriture ;
+//                 temps_recuperation_ms (production -> récupération par Spark) ;
+//                 temps_ecriture_ms     (récupération -> écriture du résultat)
+//              (complété à la fin : les tests s'accumulent)
+//   console  : médianes de ces temps par bloc d'images
+//              taille du bloc réglable : 1 = chaque image, 100 = tous les 100 images
 // ----------------------------------------------------------------------
-object PerfTracker {
+object BlockTracker {
 
-  case class Stats(avg: Double, median: Double, min: Double, max: Double)
+  val fullFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
 
-  // moyenne, médiane, min, max d'une liste de durées (None si la liste est vide)
-  def stats(values: Seq[Long]): Option[Stats] =
-    if (values.isEmpty) None
-    else {
-      val s = values.sorted
-      val n = s.size
-      val median =
-        if (n % 2 == 1) s(n / 2).toDouble
-        else (s(n / 2 - 1) + s(n / 2)) / 2.0
-      Some(Stats(s.sum.toDouble / n, median, s.head.toDouble, s.last.toDouble))
-    }
+  // millisecondes -> heure lisible
+  def fmt(ms: Long, f: DateTimeFormatter): String =
+    Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).toLocalDateTime.format(f)
 
-  // nombres au format français (virgule) pour ouvrir les CSV directement dans Excel
-  def num(d: Double): String = "%.1f".formatLocal(Locale.FRANCE, d)
-  def num2(d: Double): String = "%.2f".formatLocal(Locale.FRANCE, d)
+  def median(values: Seq[Long]): Double = {
+    val s = values.sorted
+    val n = s.size
+    if (n % 2 == 1) s(n / 2).toDouble else (s(n / 2 - 1) + s(n / 2)) / 2.0
+  }
 
-  val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-  val msFormatter   = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+  val header: String = "image;heure_production;heure_ecriture;temps_recuperation_ms;temps_ecriture_ms"
+}
 
-  val statsHeader: String = Seq(
-    "type", "date", "batch_size", "interval_ms", "max_files_per_trigger",
-    "image_de", "image_a", "nb_batchs", "duree_s", "debit_img_s",
-    "batch_ms_moy", "batch_ms_med", "batch_ms_min", "batch_ms_max",
-    "attente_ms_moy", "attente_ms_med", "attente_ms_min", "attente_ms_max"
-  ).mkString(";")
+class BlockTracker(csvPath: String, blockSize: Int) {
+  import BlockTracker._
 
-  val imagesHeader: String = Seq(
-    "batch_size", "interval_ms", "max_files_per_trigger", "batch_id",
-    "image", "true_label", "predicted_label", "probability", "correct",
-    "arrivee", "debut_batch", "attente_ms", "decodage_ms", "prediction_ms", "partition"
-  ).mkString(";")
+  // (temps de récupération, temps d'écriture) des images en attente d'un bloc complet, en ms
+  private val pending    = mutable.ArrayBuffer[(Long, Long)]()
+  private var imagesDone = 0L
+  private var blockNo    = 0L
 
-  // ajoute des lignes à la fin d'un CSV (écrit l'en-tête si le fichier est nouveau)
-  def appendLines(path: String, header: String, lines: Seq[String]): Unit = {
-    val file  = new File(path)
+  // appelé après chaque batch avec (image, heure de production, heure de récupération, heure d'écriture) en ms
+  def add(images: Seq[(String, Long, Long, Long)]): Unit = synchronized {
+
+    // 1. une ligne par image dans perf.csv (en-tête écrit seulement si le fichier est nouveau)
+    val file  = new File(csvPath)
     val isNew = !file.exists()
     if (file.getParentFile != null) file.getParentFile.mkdirs()
     val out = new PrintWriter(new FileWriter(file, true))
     try {
       if (isNew) out.println(header)
-      lines.foreach(out.println)
+      images.foreach { case (image, prod, recup, ecr) =>
+        out.println(s"$image;${fmt(prod, fullFormatter)};${fmt(ecr, fullFormatter)};${recup - prod};${ecr - recup}")
+      }
     } finally out.close()
-  }
-}
 
-class PerfTracker(statsCsv: String, imagesCsv: String,
-                  batchSize: String, intervalMs: String, maxFiles: Int,
-                  blockSize: Int = 100) {
-  import PerfTracker._
-
-  // temps d'attente des images, rangés par numéro de batch en attendant le bilan du batch
-  private val pendingWaits = mutable.Map[Long, Seq[Long]]()
-
-  // bloc de 100 images en cours
-  private val blockBatchMs = mutable.ArrayBuffer[Long]()
-  private val blockWaitMs  = mutable.ArrayBuffer[Long]()
-  private var blockImages  = 0L
-  private var blockStartMs = 0L
-
-  // depuis le début du flux
-  private val allBatchMs  = mutable.ArrayBuffer[Long]()
-  private val allWaitMs   = mutable.ArrayBuffer[Long]()
-  private var totalImages = 0L
-  private var startMs     = 0L
-  private var lastEndMs   = 0L
-  private var finished    = false
-
-  // appelé par writeBatch : écrit une ligne par image dans perf_images.csv
-  // et garde les temps d'attente pour les statistiques du bloc
-  def addImages(batchId: Long, rows: Seq[Row]): Unit = synchronized {
-    pendingWaits(batchId) = rows.map(_.getAs[Long]("wait_ms"))
-
-    val lines = rows.map { r =>
-      Seq(
-        batchSize, intervalMs, maxFiles.toString, batchId.toString,
-        r.getAs[String]("image_path").split("/").last,
-        r.getAs[String]("true_label"),
-        r.getAs[String]("predicted_label"),
-        num2(r.getAs[Float]("probability").toDouble),
-        r.getAs[Boolean]("correct").toString,
-        r.getAs[java.sql.Timestamp]("arrival_time").toLocalDateTime.format(msFormatter),
-        r.getAs[java.sql.Timestamp]("prediction_time").toLocalDateTime.format(msFormatter),
-        r.getAs[Long]("wait_ms").toString,
-        num2(r.getAs[Double]("decode_ms")),
-        num2(r.getAs[Double]("predict_ms")),
-        r.getAs[Int]("partition").toString
-      ).mkString(";")
-    }
-    appendLines(imagesCsv, imagesHeader, lines)
-  }
-
-  // appelé par le listener après chaque batch contenant des images
-  def onBatch(batchId: Long, batchStartMs: Long, durationMs: Long, nImages: Long): Unit = synchronized {
-    if (finished) reset() // un nouveau flux commence après un arrêt : on repart de zéro
-
-    val waits = pendingWaits.remove(batchId).getOrElse(Seq.empty)
-
-    if (startMs == 0L) startMs = batchStartMs
-    if (blockImages == 0L) blockStartMs = batchStartMs
-    lastEndMs = batchStartMs + durationMs
-
-    blockBatchMs += durationMs
-    allBatchMs   += durationMs
-    blockWaitMs ++= waits
-    allWaitMs   ++= waits
-    blockImages  += nImages
-    totalImages  += nImages
-
-    if (blockImages >= blockSize) flushBlock()
-  }
-
-  // appelé par le listener quand Spark ne trouve plus d'image (environ 10 s après le dernier batch)
-  def onIdle(): Unit = synchronized {
-    if (totalImages > 0 && !finished) {
-      if (blockImages > 0) flushBlock() // dernier bloc incomplet (moins de 100 images)
-
-      println(s"[Perf] ===== Flux terminé : $totalImages images traitées =====")
-      writeStatsRow("total", 1, totalImages, allBatchMs, allWaitMs, startMs, lastEndMs)
-      finished = true
+    // 2. médiane par bloc, affichée quand un bloc est complet
+    pending ++= images.map { case (_, prod, recup, ecr) => (recup - prod, ecr - recup) }
+    while (pending.size >= blockSize) {
+      printBlock(pending.take(blockSize).toList)
+      pending.remove(0, blockSize)
     }
   }
 
-  private def flushBlock(): Unit = {
-    writeStatsRow("bloc", totalImages - blockImages + 1, totalImages, blockBatchMs, blockWaitMs, blockStartMs, lastEndMs)
-    blockBatchMs.clear()
-    blockWaitMs.clear()
-    blockImages = 0L
+  // appelé quand il n'y a plus d'image : affiche le dernier bloc incomplet
+  def flushRemaining(): Unit = synchronized {
+    if (pending.nonEmpty) {
+      printBlock(pending.toList)
+      pending.clear()
+    }
   }
 
-  private def reset(): Unit = {
-    pendingWaits.clear()
-    blockBatchMs.clear(); blockWaitMs.clear(); blockImages = 0L; blockStartMs = 0L
-    allBatchMs.clear();   allWaitMs.clear();   totalImages = 0L; startMs = 0L; lastEndMs = 0L
-    finished = false
-  }
-
-  // écrit une ligne de statistiques dans perf.csv et l'affiche en console
-  private def writeStatsRow(kind: String, from: Long, to: Long,
-                            batchMs: Seq[Long], waitMs: Seq[Long],
-                            fromMs: Long, toMs: Long): Unit = {
-
-    val images  = to - from + 1
-    val seconds = (toMs - fromMs) / 1000.0
-    val rate    = if (seconds > 0) images / seconds else 0.0
-    val b       = stats(batchMs)
-    val w       = stats(waitMs)
-
-    def cells(s: Option[Stats]): Seq[String] =
-      s.map(x => Seq(num(x.avg), num(x.median), num(x.min), num(x.max))).getOrElse(Seq("", "", "", ""))
-
-    val line = (Seq(
-      kind, LocalDateTime.now().format(dateFormatter), batchSize, intervalMs, maxFiles.toString,
-      from.toString, to.toString, batchMs.size.toString, num(seconds), num(rate)
-    ) ++ cells(b) ++ cells(w)).mkString(";")
-
-    appendLines(statsCsv, statsHeader, Seq(line))
-
-    // affichage console
-    val label = if (kind == "total") "TOTAL" else s"images $from-$to"
-    println(s"[Perf] $label : ${num(seconds)} s (${num(rate)} img/s) | ${batchMs.size} batchs")
-    b.foreach(x => println(s"[Perf]   batch   (ms) : moy ${num(x.avg)} | méd ${num(x.median)} | min ${num(x.min)} | max ${num(x.max)}"))
-    w.foreach(x => println(s"[Perf]   attente (ms) : moy ${num(x.avg)} | méd ${num(x.median)} | min ${num(x.min)} | max ${num(x.max)}"))
+  private def printBlock(durations: Seq[(Long, Long)]): Unit = {
+    blockNo += 1
+    val from = imagesDone + 1
+    imagesDone += durations.size
+    def num(d: Double): String = "%.1f".formatLocal(Locale.FRANCE, d)
+    val recup = median(durations.map(_._1))
+    val ecr   = median(durations.map(_._2))
+    val total = median(durations.map { case (r, e) => r + e })
+    println(s"[Bloc $blockNo] images $from-$imagesDone : médianes récupération ${num(recup)} ms" +
+            s" | écriture ${num(ecr)} ms | total ${num(total)} ms")
   }
 }
 
@@ -227,15 +125,6 @@ object ImageClassifierConsumer {
 
   // Taille d'entrée du modèle : toutes les images sont ramenées à 64x64
   val ImgSize = 64
-
-  // Log horodaté (utilisé seulement au démarrage)
-  val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-
-  def log(message: String): Unit =
-    println(s"[${LocalDateTime.now().format(timestampFormatter)}] $message")
-
-  // Durée écoulée depuis startNanos, en millisecondes
-  def elapsedMs(startNanos: Long): Double = (System.nanoTime() - startNanos) / 1e6
 
   // --------------------------------------------------------------------
   // Octets bruts (JPG) --> vecteur de features pour le modèle
@@ -280,21 +169,13 @@ object ImageClassifierConsumer {
     features
   }
 
-  // Prétraitement chronométré : renvoie le vecteur + la durée du décodage
-  def timedPreprocess(bytes: Array[Byte]): Prepared = {
-    val start    = System.nanoTime()
-    val features = preprocessImage(bytes)
-    Prepared(features, elapsedMs(start))
-  }
-
   // --------------------------------------------------------------------
-  // Features --> prédiction du modèle ONNX (chronométrée)
+  // Features --> prédiction du modèle ONNX
   //   entrée du modèle  : "input"  = matrice [1 image x 12 288 features]
   //   sorties du modèle : label prédit + probabilités de chaque classe
   // --------------------------------------------------------------------
   def predict(features: Seq[Float], modelPath: String): Prediction = {
     val session = OnnxModel.get(modelPath)
-    val start   = System.nanoTime() // après le chargement : on ne mesure que l'inférence
     val tensor  = OnnxTensor.createTensor(OrtEnvironment.getEnvironment, Array(features.toArray))
 
     try {
@@ -302,7 +183,7 @@ object ImageClassifierConsumer {
       try {
         val labels = result.get(0).getValue.asInstanceOf[Array[String]]
         val probas = result.get(1).getValue.asInstanceOf[Array[Array[Float]]]
-        Prediction(labels(0), probas(0).max, elapsedMs(start))
+        Prediction(labels(0), probas(0).max) // probabilité de la classe prédite
       } finally result.close()
     } finally tensor.close()
   }
@@ -320,18 +201,10 @@ object ImageClassifierConsumer {
     val maxFilesPerTrigger = config.getInt("consumer.max.files.per.trigger")
     val outputDir          = config.getString(s"consumer.$mode.output.dir")
     val checkpointDir      = config.getString(s"consumer.$mode.checkpoint.dir")
-    val perfCsv            = config.getString("consumer.perf.csv")         // statistiques tous les 100 images
-    val perfImagesCsv      = config.getString("consumer.perf.images.csv")  // une ligne par image
+    val perfCsv            = config.getString("consumer.perf.csv")
+    val blockSize          = config.getInt("consumer.perf.bloc")           // 1 ou 100 images par bloc
 
-    // On relit la config du producer pour noter batch.size et interval.ms dans les CSV
-    val producerConfFile = new File(config.getString("consumer.perf.producer.conf"))
-    val producerConf     = ConfigFactory.parseFile(producerConfFile)
-    val prodBatchSize    =
-      if (producerConf.hasPath("producer.batch.size")) producerConf.getInt("producer.batch.size").toString else "?"
-    val prodIntervalMs   =
-      if (producerConf.hasPath("producer.interval.ms")) producerConf.getLong("producer.interval.ms").toString else "?"
-
-    val perf = new PerfTracker(perfCsv, perfImagesCsv, prodBatchSize, prodIntervalMs, maxFilesPerTrigger)
+    val tracker = new BlockTracker(perfCsv, blockSize)
 
     val spark = SparkSession.builder()
       .appName("ImageClassifierConsumer")
@@ -359,23 +232,16 @@ object ImageClassifierConsumer {
       .load(inputDir)
 
     // 4-5. Décodage + préparation pour le modèle via UDF
-    // asNondeterministic : on extrait 2 champs du résultat (features, decode_ms),
-    // Spark ne doit pas appeler l'UDF une fois par champ
-    val preprocessUDF = udf((bytes: Array[Byte]) => timedPreprocess(bytes))
-      .asNondeterministic()
+    val preprocessUDF = udf((bytes: Array[Byte]) => preprocessImage(bytes))
 
     val preparedData = imageStream
-      .withColumn("prep", preprocessUDF(col("content")))
       .select(
         col("path").as("image_path"),
         // label = ce qui est avant le "_" dans le nom : dest/lys_000016.jpg -> lys
         regexp_extract(col("path"), "([^/]+)_[^/_]+$", 1).as("label"),
-        // heure à laquelle le producer a déposé le fichier dans dest/
-        col("modificationTime").as("arrival_time"),
-        col("prep.features").as("features"),
-        col("prep.decode_ms").as("decode_ms"),
-        // numéro de la partition (donc de la tâche parallèle) qui a traité l'image
-        spark_partition_id().as("partition")
+        // heure de production = heure à laquelle le producer a déposé le fichier dans dest/
+        col("modificationTime").as("production_time"),
+        preprocessUDF(col("content")).as("features")
       )
       .filter(size(col("features")) > 0) // on écarte les images illisibles
 
@@ -397,27 +263,21 @@ object ImageClassifierConsumer {
 
         preparedData
           .withColumn("prediction", predictUDF(col("features")))
-          .withColumn("prediction_time", current_timestamp()) // début du micro-batch
           .select(
             col("image_path"),
             col("label").as("true_label"),
             col("prediction.predicted_label"),
             col("prediction.probability"),
-            col("arrival_time"),
-            col("prediction_time"),
-            // temps passé par l'image dans dest/ avant que son micro-batch démarre
-            ((col("prediction_time").cast("double") - col("arrival_time").cast("double")) * 1000)
-              .cast("long").as("wait_ms"),
-            round(col("decode_ms"), 2).as("decode_ms"),
-            round(col("prediction.predict_ms"), 2).as("predict_ms"),
-            col("partition")
+            col("production_time"),
+            // heure de récupération = début du micro-batch qui a pris l'image
+            current_timestamp().as("recup_time")
           )
           .withColumn("correct", col("true_label") === col("predicted_label"))
       }
 
     // ----------------------------------------------------------
-    // 8. Écriture : pour chaque micro-batch, on ajoute les lignes
-    //    en Parquet, dans perf_images.csv, et on affiche le tableau
+    // 8. Écriture : pour chaque micro-batch, on ajoute les lignes en Parquet,
+    //    on note l'heure d'écriture et on affiche le tableau
     // ----------------------------------------------------------
     def writeBatch(batchDF: DataFrame, batchId: Long): Unit = {
       batchDF.persist() // évite de recalculer les UDF (écriture + affichage)
@@ -426,44 +286,46 @@ object ImageClassifierConsumer {
         .mode("append")
         .parquet(outputDir)
 
+      // heure d'écriture = moment où le batch vient d'être écrit dans output/
+      val writeMs = System.currentTimeMillis()
+
       if (mode == "train") {
         println(s"Batch $batchId : ${batchDF.count()} image(s) écrite(s) dans $outputDir")
       } else {
-        // une ligne par image dans perf_images.csv + temps d'attente pour les statistiques
-        // (au plus maxFilesPerTrigger lignes : on peut les ramener sur le driver)
-        perf.addImages(batchId, batchDF.collect().toSeq)
-
+        // tableau des prédictions
         println(s"--- Batch $batchId ---")
         batchDF
           .select(
             regexp_extract(col("image_path"), "[^/]+$", 0).as("image"),
-            // temps mis par l'image pour être récupérée (attente dans dest/, en ms)
-            col("wait_ms").as("attente_ms"),
             col("true_label"),
             col("predicted_label"),
             col("probability"),
             col("correct")
           )
           .show(maxFilesPerTrigger, truncate = false)
+
+        // (image, heure de production, heure de récupération, heure d'écriture), dans l'ordre de production
+        val times = batchDF
+          .select(regexp_extract(col("image_path"), "[^/]+$", 0), col("production_time"), col("recup_time"))
+          .collect()
+          .map(r => (r.getString(0), r.getTimestamp(1).getTime, r.getTimestamp(2).getTime, writeMs))
+          .sortBy(_._2)
+          .toSeq
+        tracker.add(times)
       }
 
       batchDF.unpersist()
     }
 
     // ----------------------------------------------------------
-    // Mesure des performances : appelé par Spark après chaque micro-batch
+    // Quand Spark ne trouve plus d'image (environ 10 s après la dernière),
+    // on écrit le dernier bloc, même s'il est incomplet
     // ----------------------------------------------------------
     spark.streams.addListener(new StreamingQueryListener {
       override def onQueryStarted(e: QueryStartedEvent): Unit = {}
       override def onQueryTerminated(e: QueryTerminatedEvent): Unit = {}
-
-      override def onQueryProgress(e: QueryProgressEvent): Unit = {
-        val p = e.progress
-        if (p.numInputRows > 0)
-          perf.onBatch(p.batchId, Instant.parse(p.timestamp).toEpochMilli, p.batchDuration, p.numInputRows)
-        else
-          perf.onIdle() // plus aucune image : bilan final
-      }
+      override def onQueryProgress(e: QueryProgressEvent): Unit =
+        if (e.progress.numInputRows == 0) tracker.flushRemaining()
     })
 
     val query = result.writeStream
@@ -471,12 +333,10 @@ object ImageClassifierConsumer {
       .option("checkpointLocation", checkpointDir)
       .start()
 
-    log(s"Consumer lancé - mode $mode")
-    println(s"Master: $master (${spark.sparkContext.defaultParallelism} tâches en parallèle)")
+    println(s"Consumer lancé - mode $mode")
     println(s"Source: $inputDir | $maxFilesPerTrigger image(s) max par batch")
-    println(s"Producer: batch.size = $prodBatchSize | interval.ms = $prodIntervalMs")
     println(s"Sortie: $outputDir")
-    println(s"Statistiques: $perfCsv (tous les 100) | $perfImagesCsv (par image)")
+    println(s"Temps par image : $perfCsv | médiane par bloc de $blockSize image(s)")
     println(s"Checkpoint: $checkpointDir")
 
     query.awaitTermination()
