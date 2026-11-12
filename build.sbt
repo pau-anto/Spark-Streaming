@@ -24,7 +24,7 @@ lazy val commonSettings = Seq(
   run / baseDirectory := (ThisBuild / baseDirectory).value
 )
 
-lazy val producer = (project in file("producer"))
+lazy val producer = (project in file("Producer"))
   .settings(
     name := "producer",
     commonSettings,

@@ -1,6 +1,6 @@
 import com.typesafe.config.ConfigFactory
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
+import org.apache.hadoop.fs.{FileUtil, Path}
 
 import org.apache.spark.sql.SparkSession
 
@@ -23,32 +23,50 @@ object ImageProducer {
   def main(args: Array[String]): Unit = {
 
     // ----------------------------------------------------------
-    // Configuration
+    // Configuration (producer/src/main/resources/application.conf)
+    // Chaque reglage peut etre surcharge par variable d'environnement
+    // (BATCH_SIZE, INTERVAL_MS, PARALLELISM, RUN_ID) : voir sweep.py
     // ----------------------------------------------------------
 
     val config = ConfigFactory.load()
 
-   val sourceDir =
-    new Path(
+    val sourceDir =
+      new Path(
         config.getString("producer.source.dir")
-    ).toUri.toString
+      ).toUri.toString
 
     val destinationDir =
-    new Path(
+      new Path(
         config.getString("producer.destination.dir")
-    ).toUri.toString
+      ).toUri.toString
 
     val batchSize =
       config.getInt("producer.batch.size")
 
+    // Periode entre le DEBUT de deux batches (cadence fixe)
     val intervalMs =
       config.getLong("producer.interval.ms")
+
+    // Nombre de copies simultanees (partitions + threads Spark)
+    val parallelism =
+      config.getInt("producer.parallelism")
+
+    // Identifiant du test : prefixe des noms de fichiers dans dest/
+    val runId =
+      config.getString("producer.run.id")
 
     val deleteSource =
       config.getBoolean("producer.delete.source")
 
     val overwrite =
       config.getBoolean("producer.overwrite")
+
+    require(batchSize > 0, "producer.batch.size doit etre > 0")
+    require(parallelism > 0, "producer.parallelism doit etre > 0")
+    require(
+      !runId.contains("__"),
+      "producer.run.id ne doit pas contenir '__' (separateur lu par le Consumer)"
+    )
 
     // ----------------------------------------------------------
     // Spark
@@ -57,7 +75,8 @@ object ImageProducer {
     val spark =
       SparkSession.builder()
         .appName("Image Producer")
-        .master("local[*]")
+        .master(s"local[$parallelism]") // p=1 : copie vraiment sequentielle
+        .config("spark.ui.enabled", "false")
         .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
@@ -65,19 +84,22 @@ object ImageProducer {
     val sc =
       spark.sparkContext
 
-    log("Producer demarre")
+    log(
+      s"Producer demarre | run=$runId | batch=$batchSize | " +
+      s"interval=${intervalMs} ms | parallelisme=$parallelism"
+    )
 
     // ----------------------------------------------------------
     // Decouverte des fichiers
     // ----------------------------------------------------------
 
-    val filesRDD =
+    // sort : meme ordre d'envoi a chaque test, donc des runs comparables
+    val files =
       sc.binaryFiles(sourceDir)
         .keys
         .filter(isImageFile)
-
-    val files =
-      filesRDD.collect()
+        .collect()
+        .sorted
 
     log(s"${files.length} image(s) trouvee(s)")
 
@@ -94,49 +116,57 @@ object ImageProducer {
     val batches =
       files.toSeq.grouped(batchSize).toSeq
 
+    // Compteurs (accumulateurs : fiables car mis a jour dans une action)
+    val copiedCount = sc.longAccumulator("copied")
+    val failedCount = sc.longAccumulator("failed")
+
+    val runStart = System.nanoTime()
+
     // ----------------------------------------------------------
     // Traitement des batches
     // ----------------------------------------------------------
 
     batches.zipWithIndex.foreach { case (batch, batchIndex) =>
 
+      val batchStart = System.nanoTime()
+
       log(
         s"Debut batch ${batchIndex + 1}/${batches.length} - ${batch.size} image(s)"
       )
 
-      // RDD du batch
-      val filesRDD =
-        sc.parallelize(batch)
+      // RDD du batch, reparti sur `parallelism` partitions
+      val batchRDD =
+        sc.parallelize(batch, parallelism)
 
       // --------------------------------------------------------
       // Copie en parallele
       // --------------------------------------------------------
 
-    filesRDD.foreachPartition { partition =>
+      batchRDD.foreachPartition { partition =>
 
         val conf =
           new Configuration()
 
-      val sourceFS =
-        FileSystem.get(conf)
+        partition.foreach { file =>
 
-      val destinationFS =
-        FileSystem.get(conf)
+          val sourcePath = new Path(file)
 
-      var count = 0
+          val fileName = sourcePath.getName
 
-      partition.foreach { file =>
+          val className = sourcePath.getParent.getName
 
-        val sourcePath = new Path(file)
+          // run__classe_fichier.jpg : le Consumer retire le prefixe "run__"
+          val destName = s"${runId}__${className}_$fileName"
 
-        val fileName = sourcePath.getName
+          val destinationPath = new Path(s"$destinationDir/$destName")
 
-        val className  = sourcePath.getParent.getName
-        
-        val destinationPath = new Path(s"$destinationDir/${className}_$fileName")
+          // Fichier cache : ignore par Spark tant que la copie n'est pas finie
+          val tmpPath = new Path(s"$destinationDir/.$destName.tmp")
 
           // ----------------------------------------------------
-          // Copie d'un fichier
+          // Copie d'un fichier : .tmp puis rename (atomique)
+          // Pas de FileSystem.close() : l'instance est partagee
+          // par tous les threads de la JVM.
           // ----------------------------------------------------
 
           try {
@@ -146,27 +176,47 @@ object ImageProducer {
             val startTime =
               System.nanoTime()
 
-        val copied =
-          FileUtil.copy(
-            sourceFS,
-            sourcePath,
-            destinationFS,
-            destinationPath,
-            deleteSource,
-            overwrite,
-            conf
-          )
+            val sourceFS =
+              sourcePath.getFileSystem(conf)
+
+            val destinationFS =
+              destinationPath.getFileSystem(conf)
+
+            // La source n'est supprimee qu'apres le rename reussi
+            val copied =
+              FileUtil.copy(
+                sourceFS,
+                sourcePath,
+                destinationFS,
+                tmpPath,
+                false,
+                overwrite,
+                conf
+              )
+
+            val published =
+              copied && destinationFS.rename(tmpPath, destinationPath)
+
+            if (!published) {
+              destinationFS.delete(tmpPath, false)
+            } else if (deleteSource) {
+              sourceFS.delete(sourcePath, false)
+            }
 
             val durationMs =
               (System.nanoTime() - startTime) / 1000000
 
-        if (copied) {
+            if (published) {
+
+              copiedCount.add(1)
 
               log(
                 s"SUCCES : $fileName | ${durationMs} ms"
               )
 
-        } else {
+            } else {
+
+              failedCount.add(1)
 
               log(
                 s"ECHEC : $fileName | ${durationMs} ms"
@@ -177,37 +227,58 @@ object ImageProducer {
 
             case e: Exception =>
 
+              failedCount.add(1)
+
               log(
                 s"ERREUR : $fileName | ${e.getClass.getSimpleName} | ${e.getMessage}"
               )
+          }
         }
-        }
-
-        sourceFS.close()
-        destinationFS.close()
       }
 
+      val elapsedMs =
+        (System.nanoTime() - batchStart) / 1000000
+
       log(
-        s"Fin batch ${batchIndex + 1}/${batches.length}"
+        s"Fin batch ${batchIndex + 1}/${batches.length} en ${elapsedMs} ms"
       )
 
       // --------------------------------------------------------
-      // Pause entre les batches
+      // Cadence fixe : on attend (interval - duree de la copie),
+      // donc flux = batch.size / (interval.ms / 1000) images/s
+      // tant que la copie dure moins que l'intervalle.
+      // (Ancien comportement : Thread.sleep(intervalMs) apres la copie.)
       // --------------------------------------------------------
 
       if (batchIndex < batches.length - 1) {
 
-        log(
-          s"Attente de ${intervalMs} ms"
-          )
+        val waitMs =
+          math.max(0L, intervalMs - elapsedMs)
 
-          Thread.sleep(intervalMs)
+        if (elapsedMs > intervalMs) {
+          log(
+            s"ATTENTION : copie (${elapsedMs} ms) plus longue que l'intervalle " +
+            s"(${intervalMs} ms), cadence non tenue"
+          )
+        } else {
+          log(s"Attente de ${waitMs} ms")
         }
+
+        Thread.sleep(waitMs)
+      }
     }
 
     // ----------------------------------------------------------
     // Fin
     // ----------------------------------------------------------
+
+    val totalSeconds =
+      (System.nanoTime() - runStart) / 1e9
+
+    log(
+      s"Run $runId : ${copiedCount.value} copiee(s), " +
+      s"${failedCount.value} echec(s) en ${"%.1f".format(totalSeconds)} s"
+    )
 
     log("Toutes les images ont ete traitees")
 
@@ -219,14 +290,10 @@ object ImageProducer {
   // Verification des fichiers images
   def isImageFile(path: String): Boolean = {
 
-    val lowerPath =
-      path.toLowerCase
+  val lowerPath =
+    path.toLowerCase
 
-    lowerPath.endsWith(".jpg") ||
-    lowerPath.endsWith(".jpeg") ||
-    lowerPath.endsWith(".png") ||
-    lowerPath.endsWith(".gif") ||
-    lowerPath.endsWith(".bmp") ||
-    lowerPath.endsWith(".webp")
-  }
+  lowerPath.endsWith(".jpg") ||
+  lowerPath.endsWith(".jpeg")
+}
 }

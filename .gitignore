@@ -9,10 +9,14 @@ project/project/
 .DS_Store
 
 # sorties de traitement, jamais versionnees
-dest/*
-output/*
-!dest/.gitkeep
-!output/.gitkeep
+dest/
+output/
+checkpoint/
+target/
+project/target/
+project/project/
+.bsp/
+*.crc
 
 # artefacts ML
 ml-service/model/*

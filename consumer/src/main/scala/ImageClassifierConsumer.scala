@@ -25,7 +25,8 @@ import org.apache.spark.sql.streaming.StreamingQueryListener._
 import org.apache.spark.sql.types._
 
 // Résultat renvoyé par l'UDF de prédiction (devient une colonne struct dans Spark)
-case class Prediction(predicted_label: String, probability: Float)
+//   infer_ms = durée de l'inférence ONNX seule (hors décodage et hors écriture)
+case class Prediction(predicted_label: String, probability: Float, infer_ms: Long)
 
 // ----------------------------------------------------------------------
 // Chargement du modèle ONNX une seule fois (et pas à chaque image)
@@ -43,6 +44,15 @@ object OnnxModel {
 }
 
 // ----------------------------------------------------------------------
+// Diagnostic : coût du prétraitement (nombre d'appels et durée cumulée),
+// remis à zéro et affiché à chaque micro-batch ([stats])
+// ----------------------------------------------------------------------
+object PreprocessStats {
+  val calls = new java.util.concurrent.atomic.AtomicLong(0)
+  val nanos = new java.util.concurrent.atomic.AtomicLong(0)
+}
+
+// ----------------------------------------------------------------------
 // Suivi du temps de traitement
 //   perf.csv : une ligne par image
 //              -> image ; heure_production ; heure_ecriture ;
@@ -51,6 +61,10 @@ object OnnxModel {
 //              (complété à la fin : les tests s'accumulent)
 //   console  : médianes de ces temps par bloc d'images
 //              taille du bloc réglable : 1 = chaque image, 100 = tous les 100 images
+//
+//   NB : temps_ecriture_ms = décodage + inférence + écriture Parquet,
+//        car l'écriture déclenche le calcul des UDF. L'inférence seule
+//        est dans la colonne infer_ms du Parquet.
 // ----------------------------------------------------------------------
 object BlockTracker {
 
@@ -173,17 +187,20 @@ object ImageClassifierConsumer {
   // Features --> prédiction du modèle ONNX
   //   entrée du modèle  : "input"  = matrice [1 image x 12 288 features]
   //   sorties du modèle : label prédit + probabilités de chaque classe
+  //   infer_ms          : durée de session.run (hors chargement du modèle)
   // --------------------------------------------------------------------
   def predict(features: Seq[Float], modelPath: String): Prediction = {
     val session = OnnxModel.get(modelPath)
     val tensor  = OnnxTensor.createTensor(OrtEnvironment.getEnvironment, Array(features.toArray))
 
     try {
+      val t0 = System.nanoTime()
       val result = session.run(Map("input" -> tensor).asJava)
       try {
         val labels = result.get(0).getValue.asInstanceOf[Array[String]]
         val probas = result.get(1).getValue.asInstanceOf[Array[Array[Float]]]
-        Prediction(labels(0), probas(0).max) // probabilité de la classe prédite
+        val inferMs = (System.nanoTime() - t0) / 1000000
+        Prediction(labels(0), probas(0).max, inferMs) // probabilité de la classe prédite
       } finally result.close()
     } finally tensor.close()
   }
@@ -229,16 +246,27 @@ object ImageClassifierConsumer {
       .schema(binarySchema)
       .option("maxFilesPerTrigger", maxFilesPerTrigger)
       .option("pathGlobFilter", "*.{jpg,jpeg,JPG,JPEG}")
+      // variable d'environnement CLEAN_SOURCE : "off" (défaut) ou "delete" (supprime chaque image traitée)
+      .option("cleanSource", sys.env.getOrElse("CLEAN_SOURCE", "off"))
       .load(inputDir)
 
     // 4-5. Décodage + préparation pour le modèle via UDF
-    val preprocessUDF = udf((bytes: Array[Byte]) => preprocessImage(bytes))
+    // asNondeterministic : empêche Spark d'appeler l'UDF plusieurs fois par image
+    val preprocessUDF = udf((bytes: Array[Byte]) => {
+      val t0 = System.nanoTime()
+      val features = preprocessImage(bytes)
+      PreprocessStats.nanos.addAndGet(System.nanoTime() - t0)
+      PreprocessStats.calls.incrementAndGet()
+      features
+    }).asNondeterministic()
 
     val preparedData = imageStream
       .select(
         col("path").as("image_path"),
-        // label = ce qui est avant le "_" dans le nom : dest/lys_000016.jpg -> lys
-        regexp_extract(col("path"), "([^/]+)_[^/_]+$", 1).as("label"),
+        // label = ce qui est entre le préfixe de run ("run__", optionnel) et le dernier "_"
+        //   dest/b5-i2000-p4__lys_000016.jpg -> lys
+        //   dest/lys_000016.jpg              -> lys
+        regexp_extract(col("path"), "(?:[^/]+__)?([^/]+)_[^/_]+$", 1).as("label"),
         // heure de production = heure à laquelle le producer a déposé le fichier dans dest/
         col("modificationTime").as("production_time"),
         preprocessUDF(col("content")).as("features")
@@ -268,6 +296,7 @@ object ImageClassifierConsumer {
             col("label").as("true_label"),
             col("prediction.predicted_label"),
             col("prediction.probability"),
+            col("prediction.infer_ms"),
             col("production_time"),
             // heure de récupération = début du micro-batch qui a pris l'image
             current_timestamp().as("recup_time")
@@ -282,9 +311,11 @@ object ImageClassifierConsumer {
     def writeBatch(batchDF: DataFrame, batchId: Long): Unit = {
       batchDF.persist() // évite de recalculer les UDF (écriture + affichage)
 
+      val tWrite = System.nanoTime()
       batchDF.write
         .mode("append")
         .parquet(outputDir)
+      val writeDurMs = (System.nanoTime() - tWrite) / 1000000
 
       // heure d'écriture = moment où le batch vient d'être écrit dans output/
       val writeMs = System.currentTimeMillis()
@@ -300,9 +331,17 @@ object ImageClassifierConsumer {
             col("true_label"),
             col("predicted_label"),
             col("probability"),
+            col("infer_ms"),
             col("correct")
           )
           .show(maxFilesPerTrigger, truncate = false)
+
+        // diagnostic : coût du prétraitement et de l'écriture pour ce micro-batch
+        val calls = PreprocessStats.calls.getAndSet(0)
+        val nanos = PreprocessStats.nanos.getAndSet(0)
+        println(s"[stats] batch $batchId : $calls appel(s) de prétraitement, " +
+                s"${if (calls > 0) (nanos / 1e6 / calls).round else 0} ms par appel, " +
+                s"écriture complète (calcul + Parquet) $writeDurMs ms")
 
         // (image, heure de production, heure de récupération, heure d'écriture), dans l'ordre de production
         val times = batchDF
@@ -319,13 +358,16 @@ object ImageClassifierConsumer {
 
     // ----------------------------------------------------------
     // Quand Spark ne trouve plus d'image (environ 10 s après la dernière),
-    // on écrit le dernier bloc, même s'il est incomplet
+    // on écrit le dernier bloc, même s'il est incomplet.
+    // Sinon, on affiche la décomposition de la durée du micro-batch ([progress]).
     // ----------------------------------------------------------
     spark.streams.addListener(new StreamingQueryListener {
       override def onQueryStarted(e: QueryStartedEvent): Unit = {}
       override def onQueryTerminated(e: QueryTerminatedEvent): Unit = {}
-      override def onQueryProgress(e: QueryProgressEvent): Unit =
+      override def onQueryProgress(e: QueryProgressEvent): Unit = {
         if (e.progress.numInputRows == 0) tracker.flushRemaining()
+        else println(s"[progress] batch ${e.progress.batchId} : ${e.progress.numInputRows} ligne(s) | durées ms ${e.progress.durationMs}")
+      }
     })
 
     val query = result.writeStream

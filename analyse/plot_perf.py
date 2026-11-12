@@ -33,8 +33,8 @@ df["duree_ms"] = (df["heure_ecriture"] - df["heure_production"]).dt.total_second
 # 2. Découper le fichier en tests : un nouveau test commence
 #    quand plus de PAUSE_TEST secondes séparent deux images
 # ----------------------------------------------------------------------
-gap = df["heure_production"].diff().dt.total_seconds()
-df["test"] = (gap.isna() | (gap > PAUSE_TEST)).cumsum()
+df = df[df["image"].str.contains("__")]
+df["test"] = df["image"].str.split("__").str[0]
 
 tests = []
 for test_id, t in df.groupby("test"):
